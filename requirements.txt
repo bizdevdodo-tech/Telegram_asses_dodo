@@ -1,1 +1,1 @@
-aiogram==3.22.0
+aiogram==3.27.0
