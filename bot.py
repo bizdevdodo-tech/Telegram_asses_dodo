@@ -34,7 +34,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 
-# Пока одна тестовая ссылка для ВСЕХ подтвержденных сотрудников
 GROUP_INVITE_URL = "https://t.me/+MB8rCDcCRJ5kOTMy"
 
 if not BOT_TOKEN:
@@ -46,7 +45,7 @@ if not WEBHOOK_URL:
 if not ADMIN_ID_RAW:
     raise RuntimeError("ADMIN_ID is not set")
 
-SUPERADMIN_ID = int(ADMIN_ID_RAW)
+ROOT_SUPERADMIN_ID = int(ADMIN_ID_RAW)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -63,6 +62,7 @@ ROLE_NAMES = {
     "employee": "Сотрудник",
     "manager": "Менеджер",
     "director": "Управляющий",
+    "superadmin": "Супер-администратор",
 }
 
 
@@ -277,6 +277,24 @@ def get_people(pizzeria, role):
     return rows
 
 
+def get_active_superadmins():
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM employees
+        WHERE
+            role = 'superadmin'
+            AND status = 'active'
+        ORDER BY full_name
+        """
+    ).fetchall()
+
+    conn.close()
+    return rows
+
+
 def save_chat(chat_id, title):
     conn = db()
 
@@ -315,7 +333,7 @@ def get_chats():
 
 
 # =========================================================
-# HELPERS
+# ACCESS / HELPERS
 # =========================================================
 
 def safe(value):
@@ -323,7 +341,20 @@ def safe(value):
 
 
 def role_name(role):
-    return ROLE_NAMES.get(role, role)
+    return ROLE_NAMES.get(role, role or "Не указана")
+
+
+def is_superadmin(user_id: int) -> bool:
+    if user_id == ROOT_SUPERADMIN_ID:
+        return True
+
+    employee = get_employee(user_id)
+
+    return bool(
+        employee
+        and employee["status"] == "active"
+        and employee["role"] == "superadmin"
+    )
 
 
 def make_member_tag(full_name):
@@ -343,7 +374,6 @@ def make_member_tag(full_name):
         if len(tag) <= 16:
             return tag
 
-        # 13 + пробел + буква + точка = 16
         return f"{last_name[:13]} {first_name[0]}."
 
     return full_name[:16]
@@ -392,12 +422,18 @@ async def send_access(user_id):
 
     employee = get_employee(user_id)
 
+    pizzeria_text = (
+        employee["pizzeria"]
+        if employee["pizzeria"]
+        else "Не требуется"
+    )
+
     await bot.send_message(
         user_id,
         (
             "✅ <b>Регистрация подтверждена</b>\n\n"
-            f"Пиццерия: <b>{safe(employee['pizzeria'])}</b>\n"
-            f"Должность: <b>{safe(role_name(employee['role']))}</b>\n\n"
+            f"Пиццерия: <b>{safe(pizzeria_text)}</b>\n"
+            f"Роль: <b>{safe(role_name(employee['role']))}</b>\n\n"
             "Нажмите кнопку ниже для вступления "
             "в рабочие группы."
         ),
@@ -426,8 +462,6 @@ async def remove_from_all_chats(user_id):
                     user_id=user_id,
                 )
 
-                # Сразу снимаем бан.
-                # Человек удален, но не заблокирован навечно.
                 await bot.unban_chat_member(
                     chat_id=chat["chat_id"],
                     user_id=user_id,
@@ -438,6 +472,7 @@ async def remove_from_all_chats(user_id):
 
         except Exception as error:
             errors += 1
+
             print(
                 "REMOVE ERROR:",
                 chat["chat_id"],
@@ -463,6 +498,15 @@ class Registration(StatesGroup):
 # =========================================================
 # KEYBOARDS
 # =========================================================
+
+def close_menu_row():
+    return [
+        InlineKeyboardButton(
+            text="✖️ Закрыть меню",
+            callback_data="menu:close",
+        )
+    ]
+
 
 def register_keyboard():
     return InlineKeyboardMarkup(
@@ -509,7 +553,7 @@ def director_question_keyboard():
     )
 
 
-def pizzeria_keyboard(prefix, user_id=None):
+def pizzeria_keyboard(prefix, user_id=None, close=False):
     rows = []
 
     for i in range(0, len(PIZZERIAS), 3):
@@ -529,6 +573,9 @@ def pizzeria_keyboard(prefix, user_id=None):
             )
 
         rows.append(row)
+
+    if close:
+        rows.append(close_menu_row())
 
     return InlineKeyboardMarkup(
         inline_keyboard=rows
@@ -554,19 +601,56 @@ def employee_role_keyboard():
     )
 
 
-def approval_keyboard(user_id):
+def approval_keyboard(user_id, allow_superadmin=False):
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="✅ Подтвердить",
+                callback_data=f"approve:{user_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"reject:{user_id}",
+            ),
+        ]
+    ]
+
+    if allow_superadmin:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⭐ Супер-администратор",
+                    callback_data=f"make_superadmin:{user_id}",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def director_request_keyboard(user_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Подтвердить",
-                    callback_data=f"approve:{user_id}",
-                ),
+                    text="🏢 Выбрать пиццерию",
+                    callback_data=f"director_choose:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ Супер-администратор",
+                    callback_data=f"make_superadmin:{user_id}",
+                )
+            ],
+            [
                 InlineKeyboardButton(
                     text="❌ Отклонить",
                     callback_data=f"reject:{user_id}",
-                ),
-            ]
+                )
+            ],
         ]
     )
 
@@ -620,7 +704,21 @@ def superadmin_menu():
                     callback_data="menu:directors",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ Супер-администраторы",
+                    callback_data="menu:superadmins",
+                )
+            ],
+            close_menu_row(),
         ]
+    )
+
+
+def dismiss_pizzeria_keyboard():
+    return pizzeria_keyboard(
+        "dismiss_pizzeria",
+        close=True,
     )
 
 
@@ -651,6 +749,7 @@ def dismiss_role_keyboard(pizzeria):
                     callback_data="menu:dismiss",
                 )
             ],
+            close_menu_row(),
         ]
     )
 
@@ -670,6 +769,7 @@ def confirm_dismiss_keyboard(user_id):
                     callback_data="menu:main",
                 )
             ],
+            close_menu_row(),
         ]
     )
 
@@ -682,13 +782,23 @@ def confirm_dismiss_keyboard(user_id):
 async def start(message: Message):
     employee = get_employee(message.from_user.id)
 
+    if is_superadmin(message.from_user.id):
+        await message.answer(
+            (
+                "⭐ Вы зарегистрированы как "
+                "супер-администратор.\n\n"
+                "Для панели управления используйте /menu"
+            )
+        )
+        return
+
     if employee and employee["status"] == "active":
         await message.answer(
             (
                 "✅ Вы зарегистрированы.\n\n"
                 f"ФИО: {employee['full_name']}\n"
                 f"Пиццерия: {employee['pizzeria']}\n"
-                f"Должность: {role_name(employee['role'])}"
+                f"Роль: {role_name(employee['role'])}"
             )
         )
         return
@@ -707,33 +817,33 @@ async def start(message: Message):
 # SUPERADMIN MENU
 # =========================================================
 
-@dp.message(Command("menu"))
-async def menu_command(message: Message):
-    if message.from_user.id != SUPERADMIN_ID:
-        return
-
+async def send_superadmin_menu(message: Message):
     await message.answer(
         "⚙️ <b>Меню супер-администратора</b>",
         parse_mode="HTML",
         reply_markup=superadmin_menu(),
     )
+
+
+@dp.message(Command("menu"))
+async def menu_command(message: Message):
+    if not is_superadmin(message.from_user.id):
+        return
+
+    await send_superadmin_menu(message)
 
 
 @dp.message(Command("меню"))
 async def menu_command_ru(message: Message):
-    if message.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(message.from_user.id):
         return
 
-    await message.answer(
-        "⚙️ <b>Меню супер-администратора</b>",
-        parse_mode="HTML",
-        reply_markup=superadmin_menu(),
-    )
+    await send_superadmin_menu(message)
 
 
 @dp.callback_query(F.data == "menu:main")
 async def menu_main(callback: CallbackQuery):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     await callback.answer()
@@ -743,6 +853,22 @@ async def menu_main(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=superadmin_menu(),
     )
+
+
+@dp.callback_query(F.data == "menu:close")
+async def menu_close(callback: CallbackQuery):
+    if not is_superadmin(callback.from_user.id):
+        return
+
+    await callback.answer()
+
+    try:
+        await callback.message.delete()
+
+    except Exception:
+        await callback.message.edit_text(
+            "✅ Меню закрыто."
+        )
 
 
 # =========================================================
@@ -877,14 +1003,35 @@ async def reg_director_yes(
     employee = get_employee(user_id)
 
     await bot.send_message(
-        SUPERADMIN_ID,
+        ROOT_SUPERADMIN_ID,
         (
             "👔 <b>Регистрация управляющего</b>\n\n"
             f"<b>ФИО:</b> {safe(employee['full_name'])}\n"
             f"<b>Телефон:</b> {safe(employee['phone'])}\n\n"
-            "Выберите пиццерию:"
+            "Выберите действие:"
         ),
         parse_mode="HTML",
+        reply_markup=director_request_keyboard(
+            user_id
+        ),
+    )
+
+
+@dp.callback_query(
+    F.data.startswith("director_choose:")
+)
+async def director_choose(callback: CallbackQuery):
+    if not is_superadmin(callback.from_user.id):
+        return
+
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "Выберите пиццерию:",
         reply_markup=pizzeria_keyboard(
             "director_pizzeria",
             user_id,
@@ -898,7 +1045,7 @@ async def reg_director_yes(
 async def director_choose_pizzeria(
     callback: CallbackQuery,
 ):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     _, user_id_raw, pizzeria = callback.data.split(":")
@@ -941,9 +1088,14 @@ async def director_choose_pizzeria(
         pizzeria,
     )
 
+    set_employee_role(
+        user_id,
+        "director",
+    )
+
     activate_employee(
         user_id,
-        SUPERADMIN_ID,
+        callback.from_user.id,
     )
 
     await callback.answer(
@@ -966,7 +1118,7 @@ async def director_choose_pizzeria(
     F.data.startswith("director_replace:")
 )
 async def director_replace(callback: CallbackQuery):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     (
@@ -989,14 +1141,12 @@ async def director_replace(callback: CallbackQuery):
         )
         return
 
-    # Старый управляющий увольняется
     dismiss_employee(old_user_id)
 
     removed, errors = await remove_from_all_chats(
         old_user_id
     )
 
-    # Новый назначается
     set_employee_pizzeria(
         new_user_id,
         pizzeria,
@@ -1009,7 +1159,7 @@ async def director_replace(callback: CallbackQuery):
 
     activate_employee(
         new_user_id,
-        SUPERADMIN_ID,
+        callback.from_user.id,
     )
 
     await callback.answer(
@@ -1047,7 +1197,7 @@ async def director_replace(callback: CallbackQuery):
 async def director_replace_cancel(
     callback: CallbackQuery,
 ):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     await callback.answer("Отменено")
@@ -1154,8 +1304,6 @@ async def reg_employee_role(
         employee["pizzeria"]
     )
 
-    # Если управляющий есть — заявка ему.
-    # Если нет — супер-админу.
     if director:
         approver_id = director["telegram_id"]
 
@@ -1163,12 +1311,16 @@ async def reg_employee_role(
             "🆕 <b>Новый сотрудник вашей пиццерии</b>"
         )
 
+        allow_superadmin = is_superadmin(approver_id)
+
     else:
-        approver_id = SUPERADMIN_ID
+        approver_id = ROOT_SUPERADMIN_ID
 
         heading = (
             "⚠️ <b>У пиццерии нет назначенного управляющего</b>"
         )
+
+        allow_superadmin = True
 
     await bot.send_message(
         approver_id,
@@ -1182,8 +1334,85 @@ async def reg_employee_role(
         ),
         parse_mode="HTML",
         reply_markup=approval_keyboard(
-            user_id
+            user_id,
+            allow_superadmin=allow_superadmin,
         ),
+    )
+
+
+# =========================================================
+# MAKE SUPERADMIN
+# =========================================================
+
+@dp.callback_query(
+    F.data.startswith("make_superadmin:")
+)
+async def make_superadmin(callback: CallbackQuery):
+    if not is_superadmin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа.",
+            show_alert=True,
+        )
+        return
+
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+
+    employee = get_employee(user_id)
+
+    if not employee:
+        await callback.answer(
+            "Пользователь не найден.",
+            show_alert=True,
+        )
+        return
+
+    if employee["status"] != "pending":
+        await callback.answer(
+            "Заявка уже обработана.",
+            show_alert=True,
+        )
+        return
+
+    set_employee_role(
+        user_id,
+        "superadmin",
+    )
+
+    set_employee_pizzeria(
+        user_id,
+        None,
+    )
+
+    activate_employee(
+        user_id,
+        callback.from_user.id,
+    )
+
+    await callback.answer(
+        "Супер-администратор назначен"
+    )
+
+    await callback.message.edit_text(
+        (
+            "⭐ <b>Супер-администратор назначен</b>\n\n"
+            f"{safe(employee['full_name'])}\n\n"
+            "Пользователь получил полный доступ "
+            "к управлению ботом."
+        ),
+        parse_mode="HTML",
+    )
+
+    await bot.send_message(
+        user_id,
+        (
+            "⭐ <b>Вам предоставлены права "
+            "супер-администратора.</b>\n\n"
+            "Для открытия панели управления "
+            "используйте /menu"
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -1221,7 +1450,12 @@ async def approve_employee(
         employee["pizzeria"]
     )
 
-    allowed_ids = {SUPERADMIN_ID}
+    allowed_ids = {ROOT_SUPERADMIN_ID}
+
+    for superadmin in get_active_superadmins():
+        allowed_ids.add(
+            superadmin["telegram_id"]
+        )
 
     if director:
         allowed_ids.add(
@@ -1268,11 +1502,19 @@ async def reject_employee(
     if not employee:
         return
 
-    director = get_director(
-        employee["pizzeria"]
-    )
+    director = None
 
-    allowed_ids = {SUPERADMIN_ID}
+    if employee["pizzeria"]:
+        director = get_director(
+            employee["pizzeria"]
+        )
+
+    allowed_ids = {ROOT_SUPERADMIN_ID}
+
+    for superadmin in get_active_superadmins():
+        allowed_ids.add(
+            superadmin["telegram_id"]
+        )
 
     if director:
         allowed_ids.add(
@@ -1316,7 +1558,7 @@ async def reject_employee(
 
 @dp.callback_query(F.data == "menu:dismiss")
 async def menu_dismiss(callback: CallbackQuery):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     await callback.answer()
@@ -1324,9 +1566,7 @@ async def menu_dismiss(callback: CallbackQuery):
     await callback.message.edit_text(
         "❌ <b>Увольнение</b>\n\nВыберите пиццерию:",
         parse_mode="HTML",
-        reply_markup=pizzeria_keyboard(
-            "dismiss_pizzeria"
-        ),
+        reply_markup=dismiss_pizzeria_keyboard(),
     )
 
 
@@ -1336,7 +1576,7 @@ async def menu_dismiss(callback: CallbackQuery):
 async def dismiss_choose_pizzeria(
     callback: CallbackQuery,
 ):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     await callback.answer()
@@ -1362,7 +1602,7 @@ async def dismiss_choose_pizzeria(
 async def dismiss_choose_role(
     callback: CallbackQuery,
 ):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     _, pizzeria, role = callback.data.split(":")
@@ -1410,6 +1650,8 @@ async def dismiss_choose_role(
         ]
     )
 
+    rows.append(close_menu_row())
+
     await callback.message.edit_text(
         (
             f"❌ <b>Увольнение</b>\n\n"
@@ -1430,12 +1672,19 @@ async def dismiss_choose_role(
 async def dismiss_choose_person(
     callback: CallbackQuery,
 ):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     user_id = int(
         callback.data.split(":")[1]
     )
+
+    if user_id == ROOT_SUPERADMIN_ID:
+        await callback.answer(
+            "Корневого супер-администратора удалить нельзя.",
+            show_alert=True,
+        )
+        return
 
     employee = get_employee(user_id)
 
@@ -1470,12 +1719,19 @@ async def dismiss_choose_person(
 async def dismiss_confirm(
     callback: CallbackQuery,
 ):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     user_id = int(
         callback.data.split(":")[1]
     )
+
+    if user_id == ROOT_SUPERADMIN_ID:
+        await callback.answer(
+            "Корневого супер-администратора удалить нельзя.",
+            show_alert=True,
+        )
+        return
 
     employee = get_employee(user_id)
 
@@ -1531,7 +1787,7 @@ async def dismiss_confirm(
 
 @dp.callback_query(F.data == "menu:employees")
 async def menu_employees(callback: CallbackQuery):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     await callback.answer()
@@ -1542,7 +1798,9 @@ async def menu_employees(callback: CallbackQuery):
         """
         SELECT *
         FROM employees
-        WHERE status = 'active'
+        WHERE
+            status = 'active'
+            AND role != 'superadmin'
         ORDER BY pizzeria, role, full_name
         """
     ).fetchall()
@@ -1586,7 +1844,7 @@ async def menu_employees(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "menu:directors")
 async def menu_directors(callback: CallbackQuery):
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not is_superadmin(callback.from_user.id):
         return
 
     await callback.answer()
@@ -1616,6 +1874,34 @@ async def menu_directors(callback: CallbackQuery):
 
 
 # =========================================================
+# SUPERADMIN: SUPERADMINS
+# =========================================================
+
+@dp.callback_query(F.data == "menu:superadmins")
+async def menu_superadmins(callback: CallbackQuery):
+    if not is_superadmin(callback.from_user.id):
+        return
+
+    await callback.answer()
+
+    lines = [
+        "⭐ <b>Супер-администраторы</b>\n",
+        f"• Root: <code>{ROOT_SUPERADMIN_ID}</code>",
+    ]
+
+    for person in get_active_superadmins():
+        lines.append(
+            f"• {safe(person['full_name'])}"
+        )
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=superadmin_menu(),
+    )
+
+
+# =========================================================
 # CHAT MEMBER EVENTS
 # =========================================================
 
@@ -1623,7 +1909,6 @@ async def menu_directors(callback: CallbackQuery):
 async def chat_member_changed(
     event: ChatMemberUpdated,
 ):
-    # Запоминаем группу автоматически.
     save_chat(
         event.chat.id,
         event.chat.title or str(event.chat.id),
@@ -1656,12 +1941,9 @@ async def chat_member_changed(
 
     employee = get_employee(user.id)
 
-    # Неизвестного человека пока не трогаем.
     if not employee:
         return
 
-    # Уволенный сотрудник снова вошел —
-    # сразу удаляем из группы.
     if employee["status"] == "dismissed":
         try:
             await bot.ban_chat_member(
@@ -1688,8 +1970,6 @@ async def chat_member_changed(
     if employee["status"] != "active":
         return
 
-    # Активный сотрудник —
-    # автоматически ставим ФИО-тег.
     await apply_employee_tag(
         event.chat.id,
         user.id,
